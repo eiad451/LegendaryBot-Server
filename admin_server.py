@@ -24,6 +24,9 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>JOKER Admin</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0a12;color:#eee;font-family:system-ui,sans-serif;padding:15px;direction:rtl}
@@ -88,6 +91,7 @@ label{display:block;font-size:13px;color:#889;margin-bottom:4px}
 <p class="sub">𝓙𝓸𝓴𝓮𝓻丨𝓜4 • @VT_YC • <a href="#" onclick="logout()" style="color:#e74c3c;text-decoration:none">🚪 خروج</a></p>
 <div class="tabs" id="tabs">
 <button class="tab active" onclick="showTab('dashboard')">📊 لوحة</button>
+<a href="/download-apk" style="display:inline-block;background:#f7c948;color:#0a0a12;text-decoration:none;padding:8px 15px;border-radius:8px;font-weight:bold;margin:5px;font-size:13px">📦 تحميل التطبيق</a>
 <button class="tab" onclick="showTab('products')">📦 منتجات</button>
 <button class="tab" onclick="showTab('add')">➕ إضافة</button>
 <button class="tab" onclick="showTab('orders')">📋 طلبات</button>
@@ -220,6 +224,21 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML.encode())
+            return
+        if self.path == "/download-apk":
+            apk_path = os.path.join(BASE_DIR, "JOKER_Admin_v1.0.apk")
+            if os.path.exists(apk_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.android.package-archive")
+                self.send_header("Content-Disposition", 'attachment; filename="JOKER_Admin_v1.0.apk"')
+                self.end_headers()
+                with open(apk_path, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"APK not found")
             return
         if self.path == "/api/verify":
             d = {"password": self.headers.get("X-Password", "")}

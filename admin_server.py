@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
-import http.server, json, sqlite3, os, sys, time
+import http.server, json, sqlite3, os, sys, time, threading, urllib.request, urllib.parse, html
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bot.db")
 ADMIN_PASS = "VT_YC"
+def get_bot_token():
+    t = os.getenv("BOT_TOKEN", "")
+    if t: return t
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='bot_token'")
+    r = c.fetchone()
+    conn.close()
+    return r[0] if r else ""
+
+BOT_TOKEN = get_bot_token()
+if not BOT_TOKEN:
+    print("⚠️  BOT_TOKEN not set! Set via env or admin panel (settings table key='bot_token')")
+    BOT_TOKEN = "NONE"
+
+def get_bot_username():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='bot_username'")
+    r = c.fetchone()
+    conn.close()
+    return r[0] if r else "LegendaryBot"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -18,6 +40,184 @@ def init_db():
     conn.commit(); conn.close()
 
 init_db()
+
+# ─── Telegram Bot via direct API (no external libs) ───
+def tg_token():
+    t = os.getenv("BOT_TOKEN", "")
+    if t: return t
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='bot_token'")
+    r = c.fetchone()
+    conn.close()
+    return r[0] if r else ""
+
+def tg_api(method, data=None):
+    url = f"https://api.telegram.org/bot{tg_token()}/{method}"
+    if data:
+        req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
+    else:
+        req = urllib.request.Request(url)
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return json.loads(resp.read())
+    except Exception as e:
+        print(f"⚠️  TG API error: {e}")
+        return None
+
+def tg_send(chat_id, text, markup=None):
+    d = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if markup: d["reply_markup"] = markup
+    return tg_api("sendMessage", d)
+
+def tg_edit(chat_id, msg_id, text, markup=None):
+    d = {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"}
+    if markup: d["reply_markup"] = markup
+    return tg_api("editMessageText", d)
+
+def tg_send_invoice(chat_id, title, desc, payload, price_stars, prod_id):
+    return tg_api("sendInvoice", {
+        "chat_id": chat_id, "title": title, "description": desc,
+        "payload": payload, "provider_token": "", "currency": "XTR",
+        "prices": [{"label": title, "amount": price_stars}]
+    })
+
+def tg_answer_pre_checkout(query_id, ok=True):
+    return tg_api("answerPreCheckoutQuery", {"pre_checkout_query_id": query_id, "ok": ok})
+
+def get_products_keyboard():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, name, price FROM products ORDER BY name")
+    rows = c.fetchall()
+    conn.close()
+    kb = {"inline_keyboard": []}
+    for pid, name, price in rows:
+        kb["inline_keyboard"].append([{"text": f"⭐ {price} - {name}", "callback_data": f"buy_{pid}"}])
+    return kb
+
+last_update_id = 0
+def bot_poll():
+    global last_update_id
+    err_count = 0
+    while True:
+        token = tg_token()
+        if not token:
+            if err_count == 0:
+                print("⚠️  No bot token - bot paused. Set token in admin panel")
+            err_count = 1
+            time.sleep(5)
+            continue
+        try:
+            result = tg_api("getUpdates", {"offset": last_update_id + 1, "timeout": 30})
+            if result and result.get("ok"):
+                err_count = 0
+                for upd in result.get("result", []):
+                    last_update_id = upd["update_id"]
+                    handle_update(upd)
+            else:
+                err_count += 1
+        except:
+            err_count += 1
+        time.sleep(0.5 if err_count < 5 else 5)
+
+def handle_update(upd):
+    # Handle pre_checkout_query (top-level)
+    if "pre_checkout_query" in upd:
+        pcq = upd["pre_checkout_query"]
+        tg_answer_pre_checkout(pcq["id"], True)
+        return
+
+    if "message" in upd:
+        msg = upd["message"]
+        chat_id = msg["chat"]["id"]
+        user = msg.get("from", {})
+        uid = user.get("id", chat_id)
+        uname = user.get("username", "")
+        fname = user.get("first_name", str(uid))
+        # Register user
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?,?,?)", (uid, uname, fname))
+        c.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?", (uname, fname, uid))
+        conn.commit(); conn.close()
+
+        if "successful_payment" in msg:
+            sp = msg["successful_payment"]
+            payload = sp["invoice_payload"]
+            prod_id = payload.replace("buy_", "")
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT name, code FROM products WHERE id=?", (prod_id,))
+            row = c.fetchone()
+            if row:
+                pname, pcode = row
+                c.execute("INSERT INTO orders (user_id, product_id, price, status) VALUES (?,?,?,'paid')", (uid, prod_id, sp["total_amount"]))
+                conn.commit()
+                msg_text = f"✅ <b>تم الدفع بنجاح!</b>\n\n📦 المنتج: {pname}\n🔑 الكود: <code>{pcode}</code>\n\nشكراً لشرائك من JOKER Store 🏪"
+            else:
+                msg_text = "❌ المنتج غير موجود"
+            conn.close()
+            tg_send(chat_id, msg_text)
+            return
+
+        text = msg.get("text", "")
+
+        if text == "/start":
+            kb = get_products_keyboard()
+            if not kb["inline_keyboard"]:
+                tg_send(chat_id, "🏪 <b>مرحباً بك في JOKER Store!</b>\n\n⚠️ لا توجد منتجات متاحة حالياً.\nتواصل مع @VT_YC")
+            else:
+                tg_send(chat_id, "🏪 <b>مرحباً بك في JOKER Store!</b>\n\nاختر منتجاً للشراء:", kb)
+
+        elif text == "/products":
+            kb = get_products_keyboard()
+            if not kb["inline_keyboard"]:
+                tg_send(chat_id, "⚠️ لا توجد منتجات متاحة حالياً.")
+            else:
+                tg_send(chat_id, "📦 <b>المنتجات المتاحة:</b>", kb)
+
+        elif text.startswith("/buy "):
+            prod_id = text[5:].strip()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT id, name, price, description FROM products WHERE id=?", (prod_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                pid, pname, price, desc = row
+                desc_short = (desc or "شراء " + pname)[:255]
+                tg_send_invoice(chat_id, pname[:32], desc_short, f"buy_{pid}", price, pid)
+            else:
+                tg_send(chat_id, "❌ المنتج غير موجود")
+
+    elif "callback_query" in upd:
+        cq = upd["callback_query"]
+        chat_id = cq["message"]["chat"]["id"]
+        msg_id = cq["message"]["message_id"]
+        data = cq.get("data", "")
+        uid = cq["from"]["id"]
+
+        if data.startswith("buy_"):
+            prod_id = data[4:]
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT id, name, price, description FROM products WHERE id=?", (prod_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                pid, pname, price, desc = row
+                desc_short = (desc or "شراء " + pname)[:255]
+                tg_edit(chat_id, msg_id, f"🛒 <b>جاري تجهيز الفاتورة...</b>\n\n{html.escape(pname)}\n⭐ {price} نجمة")
+                tg_send_invoice(chat_id, pname[:32], desc_short, f"buy_{pid}", price, pid)
+            else:
+                tg_edit(chat_id, msg_id, "❌ المنتج غير متوفر")
+        tg_api("answerCallbackQuery", {"callback_query_id": cq["id"]})
+
+# Start bot in background
+bot_thread = threading.Thread(target=bot_poll, daemon=True)
+bot_thread.start()
+print("🤖 Telegram Bot polling started")
 
 HTML = """<!DOCTYPE html>
 <html dir="rtl">
@@ -96,6 +296,7 @@ label{display:block;font-size:13px;color:#889;margin-bottom:4px}
 <button class="tab" onclick="showTab('add')">➕ إضافة</button>
 <button class="tab" onclick="showTab('orders')">📋 طلبات</button>
 <button class="tab" onclick="showTab('users')">👥 مستخدمين</button>
+<button class="tab" onclick="showTab('settings')">⚙️ إعدادات</button>
 </div>
 <div id="page-dashboard" class="page active"><div class="card"><div id="stats"><p class="empty">جاري التحميل...</p></div></div></div>
 <div id="page-products" class="page"><div class="card"><h3>📦 المنتجات</h3><div id="prodsList"><p class="empty">جاري التحميل...</p></div></div></div>
@@ -109,6 +310,13 @@ label{display:block;font-size:13px;color:#889;margin-bottom:4px}
 </div></div>
 <div id="page-orders" class="page"><div class="card"><h3>📋 جميع الطلبات</h3><div id="ordsList"><p class="empty">جاري التحميل...</p></div></div></div>
 <div id="page-users" class="page"><div class="card"><h3>👥 المستخدمين</h3><div id="usersList"><p class="empty">جاري التحميل...</p></div></div></div>
+<div id="page-settings" class="page">
+<div class="card"><h3>⚙️ إعدادات البوت</h3>
+<label>توكن البوت</label><input id="botToken" placeholder="123456:ABC...">
+<label>يوزر البوت</label><input id="botUsername" placeholder="MyBot">
+<button class="btn" onclick="saveBotSettings()">💾 حفظ الإعدادات</button>
+<div id="botStatus" style="margin-top:10px;font-size:13px;color:#667">جاري التحميل...</div>
+</div></div>
 </div>
 <div id="editModal" class="modal" onclick="if(event.target==this)closeEdit()"><div class="modal-content">
 <h3 id="editTitle">✏️ تعديل المنتج</h3>
@@ -134,7 +342,27 @@ async function login(){
 }
 function logout(){token='';document.getElementById('loginScreen').classList.remove('hidden');document.getElementById('panel').classList.add('hidden');document.getElementById('pwd').value=''}
 function showTab(t){document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});document.querySelectorAll('.page').forEach(function(e){e.classList.remove('active')});document.querySelector('.tab[onclick*=\"'+t+'\"]').classList.add('active');document.getElementById('page-'+t).classList.add('active');if(t!='dashboard')loadTab(t)}
-function loadTab(t){if(t=='products')loadProducts();if(t=='orders')loadOrders();if(t=='users')loadUsers()}
+function loadTab(t){if(t=='products')loadProducts();if(t=='orders')loadOrders();if(t=='users')loadUsers();if(t=='settings')loadSettings()}
+async function loadSettings(){
+  try{
+    var r=await(await fetch('/api/bot/status')).json();
+    if(r.status=='ok'){
+      document.getElementById('botToken').value=r.token||'';
+      document.getElementById('botUsername').value=r.username||'';
+      document.getElementById('botStatus').innerHTML='🤖 <b style=color:#2ecc71>متصل</b> | @'+r.bot_username+' | ID: '+r.bot_id;
+    }else{
+      document.getElementById('botStatus').innerHTML='❌ <b style=color:#e74c3c>غير متصل</b>'
+    }
+  }catch(e){}
+}
+async function saveBotSettings(){
+  var t=document.getElementById('botToken').value,u=document.getElementById('botUsername').value;
+  try{
+    var r=await(await fetch('/api/settings/update',{method:'POST',headers:{'Content-Type':'application/json',Authorization:token},body:JSON.stringify({token:t,username:u})})).json();
+    if(r.status=='ok'){toast('✅ تم الحفظ - أعد تشغيل السيرفر');loadSettings()}
+    else toast('❌ فشل',' error')
+  }catch(e){toast('❌ خطأ',' error')}
+}
 async function loadAll(){try{var r=await(await fetch('/api/stats',{headers:{Authorization:token}})).json();if(r.status=='ok')document.getElementById('stats').innerHTML='<div class=grid><div class=stat><div class=num>'+r.users+'</div><div class=lbl>المشتركين</div></div><div class=stat><div class=num>'+r.sales_count+'</div><div class=lbl>المبيعات</div></div><div class=stat><div class=num>'+r.sales_total+'</div><div class=lbl>النجوم</div></div></div>'}catch(e){};loadProducts();loadOrders();loadUsers()}
 async function loadProducts(){
   try{
@@ -298,6 +526,28 @@ class H(http.server.BaseHTTPRequestHandler):
             conn.close()
             self.json_resp({"status":"ok","users":rows})
             return
+        if self.path == "/api/bot/status":
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key='bot_token'")
+            r = c.fetchone(); token = r[0] if r else ""
+            c.execute("SELECT value FROM settings WHERE key='bot_username'")
+            r = c.fetchone(); uname = r[0] if r else ""
+            conn.close()
+            bot_info = None
+            if token:
+                try:
+                    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/getMe")
+                    resp = urllib.request.urlopen(req, timeout=5)
+                    bot_info = json.loads(resp.read()).get("result")
+                except: pass
+            if bot_info:
+                self.json_resp({"status":"ok","token":token,"username":uname,
+                                "bot_username":bot_info.get("username",""),
+                                "bot_id":bot_info.get("id",0)})
+            else:
+                self.json_resp({"status":"error","token":token,"username":uname,"bot_username":"","bot_id":0})
+            return
         self.json_resp({"error":"not found"}, 404)
 
     def do_POST(self):
@@ -337,6 +587,16 @@ class H(http.server.BaseHTTPRequestHandler):
                       (d["name"], int(d.get("price",0)), d.get("description",""), d.get("code",""), d["id"]))
             conn.commit()
             conn.close()
+            self.json_resp({"status":"ok"})
+            return
+        if self.path == "/api/settings/update":
+            if not self.auth(): self.json_resp({"error":"unauthorized"}, 401); return
+            d = self.json_body()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            if d.get("token"): c.execute("INSERT OR REPLACE INTO settings VALUES ('bot_token',?)", (d["token"],))
+            if d.get("username"): c.execute("INSERT OR REPLACE INTO settings VALUES ('bot_username',?)", (d["username"],))
+            conn.commit(); conn.close()
             self.json_resp({"status":"ok"})
             return
         self.json_resp({"error":"not found"}, 404)

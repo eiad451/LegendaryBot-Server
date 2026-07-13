@@ -226,11 +226,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self.wfile.write(HTML.encode())
             return
         if self.path == "/download-apk":
-            apk_path = os.path.join(BASE_DIR, "JOKER_Admin_v1.0.apk")
+            apk_path = os.path.join(BASE_DIR, "JOKER_Admin.apk")
             if os.path.exists(apk_path):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.android.package-archive")
-                self.send_header("Content-Disposition", 'attachment; filename="JOKER_Admin_v1.0.apk"')
+                self.send_header("Content-Disposition", 'attachment; filename="JOKER_Admin.apk"')
                 self.end_headers()
                 with open(apk_path, "rb") as f:
                     self.wfile.write(f.read())
